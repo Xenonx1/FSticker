@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from telegram import Update, InputSticker, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InputSticker, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters,
@@ -520,7 +520,7 @@ async def handle_media(update, context):
                 emoji = context.user_data["pack_emoji"]
                 base = safe_slug(title)
                 short_name = f"{base}_by_{bot_username.lower()}"
-                sticker = InputSticker(sticker=InputFile(output.read_bytes(), filename="sticker.webm"), format="video", emoji_list=[emoji])
+                sticker = InputSticker(sticker=output.read_bytes(), format="video", emoji_list=[emoji])
                 for attempt in range(6):
                     try:
                         await context.bot.create_new_sticker_set(user_id=OWNER_ID, name=short_name,
@@ -541,7 +541,7 @@ async def handle_media(update, context):
                 context.user_data.pop("pack_shape", None)
                 pack = get_pack(pack_id, OWNER_ID)
             else:
-                sticker = InputSticker(sticker=InputFile(output.read_bytes(), filename="sticker.webm"), format="video", emoji_list=[pack["emoji"]])
+                sticker = InputSticker(sticker=output.read_bytes(), format="video", emoji_list=[pack["emoji"]])
                 await context.bot.add_sticker_to_set(user_id=OWNER_ID, name=pack["short_name"], sticker=sticker)
             # Telegram is the source of truth for file IDs; sync and send the exact new sticker.
             sticker_set = await context.bot.get_sticker_set(pack["short_name"])
