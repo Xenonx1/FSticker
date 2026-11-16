@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from telegram import Update, InputFile, InputSticker
+from telegram import Update, InputSticker
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
@@ -410,7 +410,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     try:
                         with output.open("rb") as sticker_file:
                             sticker = InputSticker(
-                                sticker=InputFile(sticker_file, filename="sticker.webm"),
+                                sticker=sticker_file,
                                 format="video",
                                 emoji_list=["✨"]
                             )
@@ -454,7 +454,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 with output.open("rb") as sticker_file:
                     sticker = InputSticker(
-                        sticker=InputFile(sticker_file, filename="sticker.webm"),
+                        sticker=sticker_file,
                         format="video",
                         emoji_list=["✨"]
                     )
