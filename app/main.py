@@ -5,11 +5,10 @@ import re
 import secrets
 import tempfile
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from telegram import Update, InputFile, InputSticker, StickerFormat
+from telegram import Update, InputFile, InputSticker
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
@@ -30,6 +29,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 PUBLIC_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET") or secrets.token_urlsafe(32)
 PORT = int(os.environ.get("PORT", "10000"))
+
 MAX_STICKER_BYTES = 256 * 1024
 TMP_DIR = Path("/tmp/fstik")
 TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -99,8 +99,14 @@ def get_user(user_id: int):
         ).fetchone()
 
 
-def set_user_state(user_id: int, *, draft_title=None, active_pack_id=None,
-                   update_draft=False, update_active=False):
+def set_user_state(
+    user_id: int,
+    *,
+    draft_title=None,
+    active_pack_id=None,
+    update_draft=False,
+    update_active=False
+):
     ensure_user(user_id)
     fields, values = [], []
     if update_draft:
@@ -234,8 +240,13 @@ async def newpack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(title) > 64:
         await update.message.reply_text("Pack title must be 64 characters or fewer.")
         return
-    set_user_state(OWNER_ID, draft_title=title, update_draft=True,
-                   active_pack_id=None, update_active=True)
+    set_user_state(
+        OWNER_ID,
+        draft_title=title,
+        update_draft=True,
+        active_pack_id=None,
+        update_active=True
+    )
     await update.message.reply_text(
         f"📦 New pack: *{title}*\n\nNow send me a GIF or video for its first sticker.",
         parse_mode="Markdown"
@@ -253,8 +264,13 @@ async def add_pack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pack:
         await update.message.reply_text("I couldn't find that pack. Use /packs.")
         return
-    set_user_state(OWNER_ID, draft_title=None, update_draft=True,
-                   active_pack_id=pack["id"], update_active=True)
+    set_user_state(
+        OWNER_ID,
+        draft_title=None,
+        update_draft=True,
+        active_pack_id=pack["id"],
+        update_active=True
+    )
     await update.message.reply_text(
         f"✅ Active pack: *{pack['title']}*\nSend a GIF or video to add a sticker.",
         parse_mode="Markdown"
@@ -266,21 +282,34 @@ async def packs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await deny(update)
     packs = list_packs(OWNER_ID)
     if not packs:
-        await update.message.reply_text("You haven't created any sticker packs yet. Use /newpack Name.")
+        await update.message.reply_text(
+            "You haven't created any sticker packs yet. Use /newpack Name."
+        )
         return
     lines = ["📚 *YOUR STICKER PACKS*", ""]
     for p in packs:
-        lines.append(f"• [{p['title']}](https://t.me/addstickers/{p['short_name']}) — {p['sticker_count']} sticker(s)")
+        lines.append(
+            f"• [{p['title']}](https://t.me/addstickers/{p['short_name']}) "
+            f"— {p['sticker_count']} sticker(s)"
+        )
         lines.append(f"  Short name: `{p['short_name']}`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown",
-                                    disable_web_page_preview=True)
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
 
 
 async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorised(update):
         return await deny(update)
-    set_user_state(OWNER_ID, draft_title=None, update_draft=True,
-                   active_pack_id=None, update_active=True)
+    set_user_state(
+        OWNER_ID,
+        draft_title=None,
+        update_draft=True,
+        active_pack_id=None,
+        update_active=True
+    )
     await update.message.reply_text("✅ Finished. No pack is currently active.")
 
 
@@ -324,7 +353,9 @@ async def convert_to_webm(source: Path, output: Path):
             "-f", "webm", str(output)
         ]
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
         _, stderr = await proc.communicate()
         if proc.returncode == 0 and output.exists():
@@ -342,6 +373,7 @@ async def convert_to_webm(source: Path, output: Path):
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorised(update):
         return await deny(update)
+
     message = update.message
     media, source_type = get_media(message)
     if not media:
@@ -351,15 +383,18 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_user(OWNER_ID)
     draft_title = state["draft_pack_title"]
     pack = get_pack(state["active_pack_id"], OWNER_ID) if state["active_pack_id"] else None
+
     if not draft_title and not pack:
         await message.reply_text("First use /newpack Pack Name, or /add PackName.")
         return
 
     status = await message.reply_text("⏳ Downloading and converting your animation…")
+
     with tempfile.TemporaryDirectory(dir=TMP_DIR) as temp:
         tempdir = Path(temp)
         source = tempdir / "source_media"
         output = tempdir / "sticker.webm"
+
         try:
             tg_file = await context.bot.get_file(media.file_id)
             await tg_file.download_to_drive(custom_path=str(source))
@@ -369,32 +404,46 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 base = safe_slug(draft_title)
                 username = bot_username.lower()
                 short_name = f"{base}_by_{username}"
+
                 # Telegram names are globally unique; add a suffix if already taken.
                 for _ in range(5):
                     try:
-                        sticker = InputSticker(
-                            sticker=InputFile(output.open("rb"), filename="sticker.webm"),
-                            format=StickerFormat.VIDEO,
-                            emoji_list=["✨"]
-                        )
-                        await context.bot.create_new_sticker_set(
-                            user_id=OWNER_ID,
-                            name=short_name,
-                            title=draft_title,
-                            stickers=[sticker]
-                        )
+                        with output.open("rb") as sticker_file:
+                            sticker = InputSticker(
+                                sticker=InputFile(sticker_file, filename="sticker.webm"),
+                                format="video",
+                                emoji_list=["✨"]
+                            )
+                            await context.bot.create_new_sticker_set(
+                                user_id=OWNER_ID,
+                                name=short_name,
+                                title=draft_title,
+                                stickers=[sticker]
+                            )
                         break
                     except TelegramError as exc:
-                        if ("OCCUPIED" in str(exc).upper() or "ALREADY OCCUPIED" in str(exc).upper()):
-                            short_name = f"{base}_{secrets.token_hex(2)}_by_{username}"
+                        if (
+                            "OCCUPIED" in str(exc).upper()
+                            or "ALREADY OCCUPIED" in str(exc).upper()
+                        ):
+                            short_name = (
+                                f"{base}_{secrets.token_hex(2)}_by_{username}"
+                            )
                             continue
                         raise
                 else:
                     raise RuntimeError("Could not find an available sticker-pack name.")
+
                 pack_id = create_pack(OWNER_ID, draft_title, short_name)
-                set_user_state(OWNER_ID, draft_title=None, update_draft=True,
-                               active_pack_id=pack_id, update_active=True)
+                set_user_state(
+                    OWNER_ID,
+                    draft_title=None,
+                    update_draft=True,
+                    active_pack_id=pack_id,
+                    update_active=True
+                )
                 record_sticker(pack_id, "created-in-sticker-set", source_type)
+
                 await status.edit_text(
                     f"✅ Pack created: *{draft_title}*\n"
                     f"https://t.me/addstickers/{short_name}\n\n"
@@ -403,39 +452,48 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     disable_web_page_preview=True
                 )
             else:
-                sticker = InputSticker(
-                    sticker=InputFile(output.open("rb"), filename="sticker.webm"),
-                    format=StickerFormat.VIDEO,
-                    emoji_list=["✨"]
-                )
-                await context.bot.add_sticker_to_set(
-                    user_id=OWNER_ID,
-                    name=pack["short_name"],
-                    sticker=sticker
-                )
+                with output.open("rb") as sticker_file:
+                    sticker = InputSticker(
+                        sticker=InputFile(sticker_file, filename="sticker.webm"),
+                        format="video",
+                        emoji_list=["✨"]
+                    )
+                    await context.bot.add_sticker_to_set(
+                        user_id=OWNER_ID,
+                        name=pack["short_name"],
+                        sticker=sticker
+                    )
+
                 record_sticker(pack["id"], "added-to-sticker-set", source_type)
                 await status.edit_text(
                     f"✅ Sticker added to *{pack['title']}*.\n"
                     f"Total stickers recorded: {pack['sticker_count'] + 1}",
                     parse_mode="Markdown"
                 )
+
         except Exception as exc:
             log.exception("Sticker processing failed")
             msg = str(exc)
-            await status.edit_text("❌ " + (msg[:900] if msg else "Sticker processing failed."))
+            await status.edit_text(
+                "❌ " + (msg[:900] if msg else "Sticker processing failed.")
+            )
 
 
 async def on_startup():
     global telegram_app, bot_username
+
     pool.open(wait=True)
     init_db()
+
     telegram_app = Application.builder().token(BOT_TOKEN).build()
     await telegram_app.initialize()
     await telegram_app.start()
+
     me = await telegram_app.bot.get_me()
     bot_username = me.username or ""
     if not bot_username:
         raise RuntimeError("Could not determine bot username from Telegram.")
+
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("help", help_cmd))
     telegram_app.add_handler(CommandHandler("newpack", newpack))
@@ -444,8 +502,10 @@ async def on_startup():
     telegram_app.add_handler(CommandHandler("done", done_cmd))
     telegram_app.add_handler(CommandHandler("cancel", cancel_cmd))
     telegram_app.add_handler(MessageHandler(
-        filters.VIDEO | filters.ANIMATION | filters.Document.ALL, handle_media
+        filters.VIDEO | filters.ANIMATION | filters.Document.ALL,
+        handle_media
     ))
+
     await telegram_app.bot.set_webhook(
         url=f"{PUBLIC_URL}/telegram/{WEBHOOK_SECRET}",
         secret_token=WEBHOOK_SECRET,
@@ -479,9 +539,13 @@ async def health():
 async def telegram_webhook(secret: str, request: Request):
     if not secrets.compare_digest(secret, WEBHOOK_SECRET):
         raise HTTPException(status_code=404)
-    header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+
+    header_secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token", ""
+    )
     if not secrets.compare_digest(header_secret, WEBHOOK_SECRET):
         raise HTTPException(status_code=403)
+
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
