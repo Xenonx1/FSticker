@@ -416,4 +416,153 @@ async def handle_text(update, context):
             await update.effective_message.reply_text("Title must be 64 characters or fewer.")
             return
         pack_id = context.user_data.get("rename_pack_id")
-        pack = get_pack(pack_id,
+        pack = get_pack(pack_id, OWNER_ID)
+        if not pack:
+            context.user_data.pop("flow", None)
+            await update.effective_message.reply_text("Pack not found.", reply_markup=main_keyboard())
+            return
+        try:
+            await context.bot.set_sticker_set_title(pack["short_name"], text)
+            rename_pack_record(pack_id, OWNER_ID, text)
+            await update.effective_message.reply_text("✅ Pack title updated.", reply_markup=main_keyboard())
+        except TelegramError as exc:
+            await update.effective_message.reply_text(f"Telegram couldn't change the title: {exc}")
+        context.user_data.pop("flow", None)
+
+
+async def handle_media(update, context):
+    if not is_owner(update):
+        return await deny(update)
+    msg = update.effective_message
+    media, source_type = get_media(msg)
+    if not media:
+        return
+    state = get_user(OWNER_ID)
+    pack = get_pack(state["active_pack_id"], OWNER_ID) if state["active_pack_id"] else None
+    creating = context.user_data.get("flow") == WAIT_MEDIA and context.user_data.get("draft_title")
+    if not creating and not pack:
+        await msg.reply_text("First choose Create Pack or select an Active Pack from the menu.", reply_markup=main_keyboard())
+        return
+    status = await msg.reply_text("⏳ Converting your video into an animated sticker…")
+    with tempfile.TemporaryDirectory(dir=TMP_DIR) as td:
+        source, output = Path(td) / "input", Path(td) / "sticker.webm"
+        try:
+            tg_file = await context.bot.get_file(media.file_id)
+            await tg_file.download_to_drive(custom_path=str(source))
+            await convert_to_webm(source, output)
+            if creating:
+                title = context.user_data["draft_title"]
+                emoji = context.user_data["pack_emoji"]
+                base = safe_slug(title)
+                short_name = f"{base}_by_{bot_username.lower()}"
+                sticker = InputSticker(sticker=output.read_bytes(), format="video", emoji_list=[emoji])
+                for attempt in range(6):
+                    try:
+                        await context.bot.create_new_sticker_set(user_id=OWNER_ID, name=short_name,
+                            title=title, stickers=[sticker])
+                        break
+                    except TelegramError as exc:
+                        if "OCCUPIED" in str(exc).upper() or "ALREADY OCCUPIED" in str(exc).upper():
+                            short_name = f"{base}_{secrets.token_hex(2)}_by_{bot_username.lower()}"
+                            continue
+                        raise
+                else:
+                    raise RuntimeError("Couldn't find an available sticker pack name.")
+                pack_id = create_pack(OWNER_ID, title, short_name, emoji)
+                update_user(OWNER_ID, active_pack_id=pack_id, draft_pack_title=None)
+                context.user_data.pop("flow", None)
+                context.user_data.pop("draft_title", None)
+                context.user_data.pop("pack_emoji", None)
+                pack = get_pack(pack_id, OWNER_ID)
+            else:
+                sticker = InputSticker(sticker=output.read_bytes(), format="video", emoji_list=[pack["emoji"]])
+                await context.bot.add_sticker_to_set(user_id=OWNER_ID, name=pack["short_name"], sticker=sticker)
+            # Telegram is the source of truth for file IDs; sync and send the exact new sticker.
+            sticker_set = await context.bot.get_sticker_set(pack["short_name"])
+            known = {x["file_unique_id"] for x in list_stickers(pack["id"]) if x["file_unique_id"]}
+            new_stickers = [s for s in sticker_set.stickers if s.file_unique_id not in known]
+            if new_stickers:
+                new_sticker = new_stickers[-1]
+            else:
+                # For first sticker, DB is empty; otherwise Telegram may deduplicate identical media.
+                new_sticker = sticker_set.stickers[-1]
+            save_sticker(pack["id"], new_sticker, source_type)
+            await status.edit_text(f"✅ Added to *{pack['title']}*.", parse_mode="Markdown")
+            await context.bot.send_sticker(chat_id=OWNER_ID, sticker=new_sticker.file_id)
+            await context.bot.send_message(chat_id=OWNER_ID,
+                text=f"Sticker uploaded successfully.\nPack: {pack['title']}\nhttps://t.me/addstickers/{pack['short_name']}")
+        except Exception as exc:
+            log.exception("Sticker processing failed")
+            await status.edit_text("❌ " + (str(exc)[:850] or "Sticker processing failed."))
+
+
+async def cancel_cmd(update, context):
+    if not is_owner(update):
+        return await deny(update)
+    context.user_data.pop("flow", None)
+    context.user_data.pop("draft_title", None)
+    context.user_data.pop("pack_emoji", None)
+    await update.effective_message.reply_text("Cancelled.", reply_markup=main_keyboard())
+
+
+async def done_cmd(update, context):
+    if not is_owner(update):
+        return await deny(update)
+    update_user(OWNER_ID, active_pack_id=None, draft_pack_title=None)
+    context.user_data.pop("flow", None)
+    await update.effective_message.reply_text("No active pack selected.", reply_markup=main_keyboard())
+
+
+async def on_startup():
+    global tg_app, bot_username
+    pool.open(wait=True)
+    init_db()
+    tg_app = Application.builder().token(BOT_TOKEN).build()
+    await tg_app.initialize()
+    await tg_app.start()
+    me = await tg_app.bot.get_me()
+    bot_username = me.username or ""
+    if not bot_username:
+        raise RuntimeError("Could not determine bot username.")
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(CommandHandler("help", help_cmd))
+    tg_app.add_handler(CommandHandler("cancel", cancel_cmd))
+    tg_app.add_handler(CommandHandler("done", done_cmd))
+    tg_app.add_handler(CallbackQueryHandler(callback_handler))
+    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    tg_app.add_handler(MessageHandler(filters.VIDEO | filters.ANIMATION | filters.Document.ALL, handle_media))
+    await tg_app.bot.set_webhook(url=f"{PUBLIC_URL}/telegram/{WEBHOOK_SECRET}",
+        secret_token=WEBHOOK_SECRET, allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    log.info("Bot @%s webhook configured", bot_username)
+
+
+@app.on_event("startup")
+async def startup_event():
+    await on_startup()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if tg_app:
+        await tg_app.bot.delete_webhook()
+        await tg_app.stop()
+        await tg_app.shutdown()
+    pool.close()
+
+
+@app.get("/")
+async def health():
+    return {"ok": True, "service": "private-animated-sticker-bot"}
+
+
+@app.post("/telegram/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if not secrets.compare_digest(secret, WEBHOOK_SECRET):
+        raise HTTPException(status_code=404)
+    header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not secrets.compare_digest(header_secret, WEBHOOK_SECRET):
+        raise HTTPException(status_code=403)
+    data = await request.json()
+    update = Update.de_json(data, tg_app.bot)
+    await tg_app.process_update(update)
+    return JSONResponse({"ok": True})
