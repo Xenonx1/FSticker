@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from telegram import Update, InputSticker, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InputSticker, InputFile, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters,
@@ -27,6 +27,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 PUBLIC_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET") or secrets.token_urlsafe(32)
 MAX_STICKER_BYTES = 256 * 1024
+MAX_INPUT_BYTES = 20 * 1024 * 1024  # Telegram cloud Bot API download ceiling
 TMP_DIR = Path("/tmp/fstik")
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -41,6 +42,8 @@ WAIT_TITLE = "wait_title"
 WAIT_EMOJI = "wait_emoji"
 WAIT_RENAME = "wait_rename"
 WAIT_MEDIA = "wait_media"
+WAIT_SHAPE = "wait_shape"
+SHAPES = {"square", "rectangle", "rounded", "circle", "oval", "heart", "star"}
 
 
 def init_db():
@@ -60,6 +63,7 @@ def init_db():
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
         # Additive migrations only: preserve existing users, packs and records.
         conn.execute("ALTER TABLE packs ADD COLUMN IF NOT EXISTS emoji TEXT NOT NULL DEFAULT '✨'")
+        conn.execute("ALTER TABLE packs ADD COLUMN IF NOT EXISTS shape TEXT NOT NULL DEFAULT 'square'")
         conn.execute("ALTER TABLE sticker_items ADD COLUMN IF NOT EXISTS file_unique_id TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS sticker_items_pack_idx ON sticker_items(pack_id)")
         conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS sticker_items_unique_idx
@@ -91,10 +95,10 @@ def update_user(uid, **fields):
         c.commit()
 
 
-def create_pack(uid, title, short_name, emoji):
+def create_pack(uid, title, short_name, emoji, shape="square"):
     with pool.connection() as c:
-        row = c.execute("""INSERT INTO packs(owner_id,title,short_name,emoji)
-            VALUES(%s,%s,%s,%s) RETURNING id""", (uid, title, short_name, emoji)).fetchone()
+        row = c.execute("""INSERT INTO packs(owner_id,title,short_name,emoji,shape)
+            VALUES(%s,%s,%s,%s,%s) RETURNING id""", (uid, title, short_name, emoji, shape)).fetchone()
         c.commit()
         return row["id"]
 
@@ -142,6 +146,13 @@ def delete_pack_record(pack_id, uid):
                   (uid, pack_id))
         c.commit()
 
+
+def set_pack_shape(pack_id, uid, shape):
+    if shape not in SHAPES:
+        return
+    with pool.connection() as c:
+        c.execute("UPDATE packs SET shape=%s WHERE id=%s AND owner_id=%s", (shape, pack_id, uid))
+        c.commit()
 
 def rename_pack_record(pack_id, uid, title):
     with pool.connection() as c:
@@ -242,14 +253,23 @@ async def show_pack_detail(query, pack):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎯 Set Active", callback_data=f"active:{pack['id']}")],
         [InlineKeyboardButton("🖊 Edit Title", callback_data=f"rename:{pack['id']}"),
-         InlineKeyboardButton("🗑 Delete Stickers", callback_data=f"stickers:{pack['id']}")],
+         InlineKeyboardButton("✂️ Shape", callback_data=f"shapeedit:{pack['id']}")],
+        [InlineKeyboardButton("🗑 Delete Stickers", callback_data=f"stickers:{pack['id']}")],
         [InlineKeyboardButton("❌ Delete Entire Pack", callback_data=f"delpack:{pack['id']}")],
         [InlineKeyboardButton("⬅️ My Packs", callback_data="packs")],
     ])
     await query.edit_message_text(
-        f"📦 *{pack['title']}*\nEmoji: {pack['emoji']}\nStickers recorded: {pack['sticker_count']}\n"
+        f"📦 *{pack['title']}*\nEmoji: {pack['emoji']}\nShape: {pack.get('shape', 'square')}\nStickers recorded: {pack['sticker_count']}\n"
         f"[Open pack](https://t.me/addstickers/{pack['short_name']})",
         parse_mode="Markdown", reply_markup=kb, disable_web_page_preview=True)
+
+
+def shape_keyboard(target):
+    labels = [("Square", "square"), ("Rectangle", "rectangle"), ("Rounded", "rounded"),
+              ("Circle", "circle"), ("Oval", "oval"), ("Heart", "heart"), ("Star", "star")]
+    rows = [[InlineKeyboardButton(label, callback_data=f"setshape:{target}:{value}")] for label, value in labels]
+    rows.append([InlineKeyboardButton("Cancel", callback_data="home" if target == "new" else f"open:{target}")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def callback_handler(update, context):
@@ -271,6 +291,27 @@ async def callback_handler(update, context):
         await show_packs(q, OWNER_ID, "select")
     elif data == "help":
         await q.message.reply_text("Create a pack, select it as active, then send GIFs/videos. Converted stickers are added automatically and sent back to you.", reply_markup=main_keyboard())
+    elif data == "shape_new":
+        await q.edit_message_text("Choose the default shape for this new pack:", reply_markup=shape_keyboard("new"))
+    elif data.startswith("shapeedit:"):
+        pack_id = int(data.split(":", 1)[1])
+        pack = get_pack(pack_id, OWNER_ID)
+        if pack:
+            await q.edit_message_text(f"Choose the shape for *{pack['title']}*. This applies to stickers added from now on.", parse_mode="Markdown", reply_markup=shape_keyboard(str(pack_id)))
+    elif data.startswith("setshape:"):
+        _, target, shape = data.split(":", 2)
+        if shape not in SHAPES:
+            return
+        if target == "new":
+            context.user_data["pack_shape"] = shape
+            context.user_data["flow"] = WAIT_MEDIA
+            await q.edit_message_text(f"✅ Default shape: *{shape}*. Now send the first GIF or video to create the pack.", parse_mode="Markdown")
+        else:
+            pack_id = int(target)
+            pack = get_pack(pack_id, OWNER_ID)
+            if pack:
+                set_pack_shape(pack_id, OWNER_ID, shape)
+                await q.edit_message_text(f"✅ Shape changed to *{shape}*. It will apply to new stickers.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back to pack", callback_data=f"open:{pack_id}")]]))
     elif data.startswith("delsticker:"):
         _, p_id, item_id = data.split(":")
         pack_id, item_id = int(p_id), int(item_id)
@@ -362,29 +403,46 @@ def get_media(message):
     return None, None
 
 
-async def convert_to_webm(source: Path, output: Path):
+async def convert_to_webm(source: Path, output: Path, shape="square"):
+    """Encode the first three seconds to a transparent 512x512 VP9 sticker."""
+    shape = shape if shape in SHAPES else "square"
+    # Alpha-mask expressions use normalized coordinates (0..1) on the 512 canvas.
+    masks = {
+        "rounded": "if(gte(X,28)*lte(X,W-29)*gte(Y,28)*lte(Y,H-29),255,if(lte(pow(max(28-X,0),2)+pow(max(X-(W-29),0),2)+pow(max(28-Y,0),2)+pow(max(Y-(H-29),0),2),784),255,0))",
+        "circle": "if(lte(pow(X-W/2,2)+pow(Y-H/2,2),pow(min(W,H)/2,2)),255,0)",
+        "oval": "if(lte(pow((X-W/2)/(W/2),2)+pow((Y-H/2)/(H/2),2),1),255,0)",
+        "heart": "if(lte(pow(pow(X-W/2,2)+pow(Y-H*0.38,2),0.5),W*0.22)+gte(Y,H*0.48)*lte(abs(X-W/2),W*0.48*(1-(Y-H*0.48)/(H*0.52))),255,0)",
+        "star": "if(gte(cos(atan2(Y-H/2,X-W/2))*cos(atan2(Y-H/2,X-W/2))*0+1,0),if(lte(hypot(X-W/2,Y-H/2),min(W,H)*0.48*(0.62+0.38*cos(5*atan2(Y-H/2,X-W/2)))),255,0),0)",
+    }
+    vf = ("fps=30,scale=512:512:force_original_aspect_ratio=decrease:flags=lanczos,"
+          "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black@0,format=rgba")
+    if shape in masks:
+        vf += f",geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='{masks[shape]}'"
+    vf += ",format=yuva420p"
     last_error = ""
-    # Adaptive VP9 passes: prioritize quality, reduce bitrate only as needed for Telegram's cap.
-    for bitrate in ("500k", "350k", "250k", "180k", "120k", "80k"):
+    for bitrate in ("450k", "320k", "230k", "160k", "110k", "75k"):
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(source),
-               "-t", "3", "-an", "-vf",
-               "fps=30,scale=512:512:force_original_aspect_ratio=decrease:flags=lanczos,"
-               "pad=512:512:(ow-iw)/2:(oh-ih)/2:color=black@0,format=yuva420p",
-               "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", bitrate,
-               "-maxrate", bitrate, "-bufsize", "600k", "-deadline", "good",
-               "-cpu-used", "4", "-auto-alt-ref", "0", "-metadata:s:v:0", "alpha_mode=1",
+               "-t", "3", "-an", "-vf", vf, "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
+               "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", "600k", "-deadline", "good",
+               "-cpu-used", "5", "-auto-alt-ref", "0", "-metadata:s:v:0", "alpha_mode=1",
                "-f", "webm", str(output)]
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
-                                                    stderr=asyncio.subprocess.PIPE)
-        _, err = await proc.communicate()
+        try:
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.PIPE)
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=100)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            last_error = "Encoding took too long on the free hosting instance."
+            continue
         if proc.returncode == 0 and output.exists():
             size = output.stat().st_size
             if size <= MAX_STICKER_BYTES:
                 return
-            last_error = f"Output was {size // 1024} KB."
+            last_error = f"Compressed output was {size // 1024} KB."
         else:
             last_error = err.decode("utf-8", "ignore")[-500:]
-    raise ValueError("This video could not fit Telegram's 256 KB sticker limit. Try a simpler/shorter clip. " + last_error)
+    raise ValueError("Could not encode this clip under Telegram's 256 KB sticker limit. Try a simpler clip. " + last_error)
 
 
 async def handle_text(update, context):
@@ -408,9 +466,9 @@ async def handle_text(update, context):
             await update.effective_message.reply_text("Please send one emoji, such as 😂 or ❤️.")
             return
         context.user_data["pack_emoji"] = emoji
-        context.user_data["flow"] = WAIT_MEDIA
+        context.user_data["flow"] = WAIT_SHAPE
         await update.effective_message.reply_text(
-            f"📦 Pack details saved. Emoji: {emoji}\nNow send the first GIF or video. I'll create the pack and add it automatically.")
+            f"📦 Emoji saved: {emoji}. Choose the default sticker shape:", reply_markup=shape_keyboard("new"))
     elif flow == WAIT_RENAME:
         if len(text) > 64:
             await update.effective_message.reply_text("Title must be 64 characters or fewer.")
@@ -443,19 +501,26 @@ async def handle_media(update, context):
     if not creating and not pack:
         await msg.reply_text("First choose Create Pack or select an Active Pack from the menu.", reply_markup=main_keyboard())
         return
-    status = await msg.reply_text("⏳ Converting your video into an animated sticker…")
+    file_size = getattr(media, "file_size", None)
+    if file_size and file_size > MAX_INPUT_BYTES:
+        await msg.reply_text("❌ This file is larger than 20 MB. Please send a smaller GIF/video.")
+        return
+    status = await msg.reply_text("⏳ Downloading and converting your video into an animated sticker…")
     with tempfile.TemporaryDirectory(dir=TMP_DIR) as td:
         source, output = Path(td) / "input", Path(td) / "sticker.webm"
         try:
-            tg_file = await context.bot.get_file(media.file_id)
-            await tg_file.download_to_drive(custom_path=str(source))
-            await convert_to_webm(source, output)
+            tg_file = await context.bot.get_file(media.file_id, read_timeout=120, write_timeout=120, connect_timeout=30, pool_timeout=30)
+            await tg_file.download_to_drive(custom_path=str(source), read_timeout=120, write_timeout=120, connect_timeout=30, pool_timeout=30)
+            if source.stat().st_size > MAX_INPUT_BYTES:
+                raise ValueError("This file is larger than the 20 MB input limit.")
+            shape = context.user_data.get("pack_shape", "square") if creating else pack.get("shape", "square")
+            await convert_to_webm(source, output, shape)
             if creating:
                 title = context.user_data["draft_title"]
                 emoji = context.user_data["pack_emoji"]
                 base = safe_slug(title)
                 short_name = f"{base}_by_{bot_username.lower()}"
-                sticker = InputSticker(sticker=output.read_bytes(), format="video", emoji_list=[emoji])
+                sticker = InputSticker(sticker=InputFile(output.read_bytes(), filename="sticker.webm"), format="video", emoji_list=[emoji])
                 for attempt in range(6):
                     try:
                         await context.bot.create_new_sticker_set(user_id=OWNER_ID, name=short_name,
@@ -468,14 +533,15 @@ async def handle_media(update, context):
                         raise
                 else:
                     raise RuntimeError("Couldn't find an available sticker pack name.")
-                pack_id = create_pack(OWNER_ID, title, short_name, emoji)
+                pack_id = create_pack(OWNER_ID, title, short_name, emoji, context.user_data.get("pack_shape", "square"))
                 update_user(OWNER_ID, active_pack_id=pack_id, draft_pack_title=None)
                 context.user_data.pop("flow", None)
                 context.user_data.pop("draft_title", None)
                 context.user_data.pop("pack_emoji", None)
+                context.user_data.pop("pack_shape", None)
                 pack = get_pack(pack_id, OWNER_ID)
             else:
-                sticker = InputSticker(sticker=output.read_bytes(), format="video", emoji_list=[pack["emoji"]])
+                sticker = InputSticker(sticker=InputFile(output.read_bytes(), filename="sticker.webm"), format="video", emoji_list=[pack["emoji"]])
                 await context.bot.add_sticker_to_set(user_id=OWNER_ID, name=pack["short_name"], sticker=sticker)
             # Telegram is the source of truth for file IDs; sync and send the exact new sticker.
             sticker_set = await context.bot.get_sticker_set(pack["short_name"])
@@ -502,6 +568,7 @@ async def cancel_cmd(update, context):
     context.user_data.pop("flow", None)
     context.user_data.pop("draft_title", None)
     context.user_data.pop("pack_emoji", None)
+    context.user_data.pop("pack_shape", None)
     await update.effective_message.reply_text("Cancelled.", reply_markup=main_keyboard())
 
 
@@ -517,9 +584,10 @@ async def on_startup():
     global tg_app, bot_username
     pool.open(wait=True)
     init_db()
-    tg_app = Application.builder().token(BOT_TOKEN).build()
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(connection_pool_size=16, connect_timeout=30, read_timeout=120, write_timeout=120, pool_timeout=30)
+    tg_app = Application.builder().token(BOT_TOKEN).request(request).get_updates_request(request).build()
     await tg_app.initialize()
-    await tg_app.start()
     me = await tg_app.bot.get_me()
     bot_username = me.username or ""
     if not bot_username:
@@ -531,6 +599,7 @@ async def on_startup():
     tg_app.add_handler(CallbackQueryHandler(callback_handler))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     tg_app.add_handler(MessageHandler(filters.VIDEO | filters.ANIMATION | filters.Document.ALL, handle_media))
+    await tg_app.start()
     await tg_app.bot.set_webhook(url=f"{PUBLIC_URL}/telegram/{WEBHOOK_SECRET}",
         secret_token=WEBHOOK_SECRET, allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     log.info("Bot @%s webhook configured", bot_username)
@@ -564,5 +633,11 @@ async def telegram_webhook(secret: str, request: Request):
         raise HTTPException(status_code=403)
     data = await request.json()
     update = Update.de_json(data, tg_app.bot)
-    await tg_app.process_update(update)
+    message = update.effective_message
+    is_media = bool(message and (message.animation or message.video or message.document))
+    if is_media:
+        # Do not keep Telegram's webhook request open while downloading/encoding media.
+        tg_app.create_task(tg_app.process_update(update), update=f"media update {update.update_id}")
+    else:
+        await tg_app.process_update(update)
     return JSONResponse({"ok": True})
